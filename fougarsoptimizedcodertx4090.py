@@ -190,7 +190,7 @@ def main():
     config = get_config()
     config.wallet.name = "fougarsHK"
     config.wallet.hotkey = "5HWJnmizA4cwbf7AHguxDMnssgc6HjxRwff9NskLfvK4GEhy"
-    config.repository = HF_REPOSITORY
+    config.repository = "https://huggingface.co/Lucas67/edge-maxxing-miner"
 
     subtensor = bt.subtensor(config=config)
     metagraph = subtensor.metagraph(netuid=config.netuid)
