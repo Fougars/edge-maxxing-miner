@@ -21,91 +21,64 @@ import psutil
 
 TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 MODEL_DIRECTORY = "model"
-HF_REPOSITORY = "Lucas67/edge-maxxing-miner"  # Updated repository name
-GITHUB_REPOSITORY = "https://github.com/fougars/bittensor-subnet39-miner"
 MODEL_ID = "stablediffusionapi/newdream-sdxl-20"
 
-class CrossAttentionPlugin(trt.IPluginV2):
-    def __init__(self, hidden_size, num_heads):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
+class TensorRTEngine:
+    def __init__(self, onnx_file_path, precision='fp16', max_batch_size=256):
+        self.engine = self.build_engine(onnx_file_path, precision, max_batch_size)
+        self.context = self.engine.create_execution_context()
+        self.inputs, self.outputs, self.bindings, self.stream = self.allocate_buffers(max_batch_size)
 
-    def get_output_shape(self, input_shape):
-        batch_size, seq_length, _ = input_shape
-        return (batch_size, seq_length, self.hidden_size)
+    def build_engine(self, onnx_file_path, precision='fp16', max_batch_size=256):
+        builder = trt.Builder(TRT_LOGGER)
+        network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+        config = builder.create_builder_config()
+        parser = trt.OnnxParser(network, TRT_LOGGER)
 
-    def configure_plugin(self, in_out):
-        in_out[0].dtype = trt.DataType.HALF
-        in_out[0].shape = self.get_output_shape(in_out[0].shape)
-        in_out[1].dtype = trt.DataType.HALF
-        in_out[1].shape = self.get_output_shape(in_out[1].shape)
-        return in_out
+        with open(onnx_file_path, 'rb') as model:
+            if not parser.parse(model.read()):
+                print('ERROR: Failed to parse the ONNX file.')
+                for error in range(parser.num_errors):
+                    print(parser.get_error(error))
+                return None
 
-    def execute_plugin(self, inputs, outputs, stream, batch_size):
-        query, key, value = inputs
-        attention_scores = trt.matmul(query, key.transpose(1, 2))
-        attention_scores = trt.softmax(attention_scores, dim=-1)
-        attention_output = trt.matmul(attention_scores, value)
-        outputs[0] = attention_output
-        return 0
+        config.max_workspace_size = 24 * (1 << 30)  # 24 GB
+        if precision == 'fp16':
+            config.set_flag(trt.BuilderFlag.FP16)
+        
+        profile = builder.create_optimization_profile()
+        profile.set_shape("input", (1, 4, 128, 128), (max_batch_size // 2, 4, 128, 128), (max_batch_size, 4, 128, 128))
+        config.add_optimization_profile(profile)
 
-def replace_cross_attention(model):
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.MultiheadAttention):
-            hidden_size = module.embed_dim
-            num_heads = module.num_heads
-            plugin = CrossAttentionPlugin(hidden_size, num_heads)
-            layer = trt.CustomLayer(plugin, name)
-            model.replace_module(name, lambda *inputs: layer(*inputs))
-    return model
+        return builder.build_engine(network, config)
 
-def build_engine(onnx_file_path, precision='fp16', max_batch_size=256):
-    builder = trt.Builder(TRT_LOGGER)
-    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
-    config = builder.create_builder_config()
-    parser = trt.OnnxParser(network, TRT_LOGGER)
+    def allocate_buffers(self, max_batch_size):
+        inputs = []
+        outputs = []
+        bindings = []
+        stream = cuda.Stream()
+        for binding in self.engine:
+            shape = self.engine.get_binding_shape(binding)
+            shape = (max_batch_size,) + shape[1:]
+            size = trt.volume(shape) * self.engine.max_batch_size
+            dtype = trt.nptype(self.engine.get_binding_dtype(binding))
+            host_mem = cuda.pagelocked_empty(size, dtype)
+            device_mem = cuda.mem_alloc(host_mem.nbytes)
+            bindings.append(int(device_mem))
+            if self.engine.binding_is_input(binding):
+                inputs.append(HostDeviceMem(host_mem, device_mem))
+            else:
+                outputs.append(HostDeviceMem(host_mem, device_mem))
+        return inputs, outputs, bindings, stream
 
-    with open(onnx_file_path, 'rb') as model:
-        if not parser.parse(model.read()):
-            print('ERROR: Failed to parse the ONNX file.')
-            for error in range(parser.num_errors):
-                print(parser.get_error(error))
-            return None
-
-    config.max_workspace_size = 24 * (1 << 30)  # 24 GB
-    config.set_flag(trt.BuilderFlag.FP16)
-    config.set_flag(trt.BuilderFlag.STRICT_TYPES)
-
-    profile = builder.create_optimization_profile()
-    profile.set_shape("input", (1, 4, 128, 128), (max_batch_size // 2, 4, 128, 128), (max_batch_size, 4, 128, 128))
-    config.add_optimization_profile(profile)
-
-    if builder.num_DLA_cores:
-        config.default_device_type = trt.DeviceType.DLA
-        config.DLA_core = 0
-        config.set_flag(trt.BuilderFlag.STRICT_TYPES)
-
-    return builder.build_engine(network, config)
-
-def allocate_buffers(engine, max_batch_size):
-    inputs = []
-    outputs = []
-    bindings = []
-    stream = cuda.Stream()
-    for binding in engine:
-        shape = engine.get_binding_shape(binding)
-        shape = (max_batch_size,) + shape[1:]
-        size = trt.volume(shape) * engine.max_batch_size
-        dtype = trt.nptype(engine.get_binding_dtype(binding))
-        host_mem = cuda.pagelocked_empty(size, dtype)
-        device_mem = cuda.mem_alloc(host_mem.nbytes)
-        bindings.append(int(device_mem))
-        if engine.binding_is_input(binding):
-            inputs.append(HostDeviceMem(host_mem, device_mem))
-        else:
-            outputs.append(HostDeviceMem(host_mem, device_mem))
-    return inputs, outputs, bindings, stream
+    def infer(self, input_data):
+        batch_size = input_data.shape[0]
+        self.context.set_binding_shape(0, (batch_size,) + input_data.shape[1:])
+        cuda.memcpy_htod_async(self.inputs[0].device, input_data.ravel(), self.stream)
+        self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
+        cuda.memcpy_dtoh_async(self.outputs[0].host, self.outputs[0].device, self.stream)
+        self.stream.synchronize()
+        return self.outputs[0].host.reshape((batch_size,) + self.engine.get_binding_shape(1)[1:])
 
 class HostDeviceMem(object):
     def __init__(self, host_mem, device_mem):
@@ -125,38 +98,34 @@ def get_adaptive_batch_size(max_batch_size=256):
         return max_batch_size
 
 def optimize_model(model, input_shape, precision='fp16', max_batch_size=256):
-    model = replace_cross_attention(model)
     model = model.eval().half().cuda()
 
+    # Pruning
     from torch.nn.utils import prune
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Conv2d) or isinstance(module, torch.nn.Linear):
             prune.l1_unstructured(module, name='weight', amount=0.2)
 
+    # Quantization
     model = torch.quantization.quantize_dynamic(
         model, {torch.nn.Linear, torch.nn.Conv2d}, dtype=torch.qint8
     )
 
+    # Export to ONNX
     dummy_input = torch.randn(*input_shape).half().cuda() 
-
-    torch.onnx.export(model, dummy_input, f"{model.__class__.__name__}.onnx", opset_version=13,
+    onnx_file = f"{model.__class__.__name__}.onnx"
+    torch.onnx.export(model, dummy_input, onnx_file, opset_version=13,
                       do_constant_folding=True, input_names=['input'],  
                       output_names=['output'], dynamic_axes={'input': {0: 'batch_size'}, 
                                                              'output': {0: 'batch_size'}})
 
-    engine = build_engine(f"{model.__class__.__name__}.onnx", precision, max_batch_size)
-    inputs, outputs, bindings, stream = allocate_buffers(engine, max_batch_size)
-    context = engine.create_execution_context()
+    # Create TensorRT engine
+    trt_engine = TensorRTEngine(onnx_file, precision, max_batch_size)
 
     def inference_fn(input_data):
         batch_size = get_adaptive_batch_size(max_batch_size)
         input_data = input_data[:batch_size]
-        context.set_binding_shape(0, (batch_size,) + input_data.shape[1:])
-        cuda.memcpy_htod_async(inputs[0].device, input_data.ravel(), stream)
-        context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
-        cuda.memcpy_dtoh_async(outputs[0].host, outputs[0].device, stream) 
-        stream.synchronize()
-        return outputs[0].host.reshape((batch_size,) + engine.get_binding_shape(1)[1:])
+        return trt_engine.infer(input_data)
 
     return inference_fn
 
